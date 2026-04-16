@@ -1,0 +1,230 @@
+name: Release Publish
+
+# Two entrypoints:
+#   1. push of tag v* (e.g. v0.1.0) — straight release publish
+#   2. workflow_dispatch with a version_bump input — computes the next
+#      tag from the latest one, pushes it, then publishes
+#
+# Publishes to:
+#   - Maven Central Portal releases (primary)
+#   - GitHub Packages (fallback / dual-publish)
+#
+# Size note: the main jar is ~835 MB. Central Portal's documented
+# per-upload ceiling is ~1 GB. If Central rejects the upload the
+# release publish job will exit non-zero (visible in the UI) but
+# the GitHub Packages job runs independently so the release artifact
+# still lands there. See snapshot.yml for the same rationale.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - manual
+      manual_version:
+        description: 'Manual version (only if "manual" selected, e.g., 1.2.3)'
+        required: false
+        type: string
+
+jobs:
+  tag:
+    name: Compute & push tag
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Compute and push new tag
+        id: compute
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Latest tag: $LATEST_TAG"
+          VERSION=${LATEST_TAG#v}
+          IFS='.' read -r -a VERSION_PARTS <<< "$VERSION"
+          MAJOR="${VERSION_PARTS[0]:-0}"
+          MINOR="${VERSION_PARTS[1]:-0}"
+          PATCH="${VERSION_PARTS[2]:-0}"
+
+          case "${{ github.event.inputs.version_bump }}" in
+            manual)
+              NEW_VERSION="${{ github.event.inputs.manual_version }}"
+              if [ -z "$NEW_VERSION" ]; then
+                echo "Error: manual_version must be set when version_bump=manual"
+                exit 1
+              fi
+              ;;
+            major)
+              NEW_VERSION="$((MAJOR + 1)).0.0"
+              ;;
+            minor)
+              NEW_VERSION="${MAJOR}.$((MINOR + 1)).0"
+              ;;
+            patch|*)
+              NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+              ;;
+          esac
+
+          NEW_TAG="v${NEW_VERSION}"
+          echo "Creating new tag: $NEW_TAG"
+          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
+          git push origin "$NEW_TAG"
+          echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build
+    needs: [tag]
+    # Run build even when tag job was skipped (tag push path).
+    if: always() && (needs.tag.result == 'success' || needs.tag.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # When triggered by workflow_dispatch we just pushed the tag in
+          # the `tag` job, so checkout that ref explicitly. For the tag
+          # push path GITHUB_REF already points at the tag.
+          ref: ${{ needs.tag.outputs.tag || github.ref }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        run: ./gradlew build --no-daemon
+
+      - name: Report jar size
+        run: |
+          JAR=$(ls build/libs/embedder-pipedocs-court-*.jar | grep -v -- '-sources\|-javadoc' | head -1)
+          SIZE=$(stat -c%s "$JAR")
+          SIZE_MB=$((SIZE / 1024 / 1024))
+          echo "Main jar: $JAR = ${SIZE_MB} MB"
+          if [ "$SIZE_MB" -gt 950 ]; then
+            echo "::warning::Jar size ${SIZE_MB} MB is within 50 MB of Central Portal's 1 GB limit"
+          fi
+
+  publish-central:
+    name: Publish to Maven Central (release)
+    needs: [tag, build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.tag.outputs.tag || github.ref }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Publish release to Central Portal
+        # Single-module: use per-project nmcp task, NOT nmcpAggregation.
+        # publishingType=AUTOMATIC in build.gradle means Central Portal
+        # will auto-close and release the bundle after validation. Change
+        # to USER_MANAGED in build.gradle if you want to review in the
+        # Central Portal UI before release.
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: ./gradlew publishAllPublicationsToCentralPortal --no-daemon --stacktrace
+
+  publish-github-packages:
+    name: Publish to GitHub Packages (release)
+    # Independent of publish-central — if Central rejects the upload
+    # (e.g. for size) the release still lands on GitHub Packages.
+    needs: [tag, build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.tag.outputs.tag || github.ref }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Publish release to GitHub Packages
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        # No --continue on release — conflicts on a release version are
+        # a real error (re-running a release with the same tag should be
+        # impossible; if it happens, we want the job to fail).
+        run: ./gradlew publishAllPublicationsToGitHubPackagesRepository --no-daemon --stacktrace
+
+  github-release:
+    name: Create GitHub Release
+    needs: [tag, publish-central, publish-github-packages]
+    if: always() && needs.build.result != 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.tag.outputs.tag || github.ref }}
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG_REF="${{ needs.tag.outputs.tag || github.ref_name }}"
+          VERSION="${TAG_REF#v}"
+          echo "tag=$TAG_REF" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          token: ${{ secrets.GITHUB_TOKEN }}

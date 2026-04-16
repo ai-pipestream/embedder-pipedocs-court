@@ -49,6 +49,14 @@ repositories {
 // src/main/resources/** into the jar. No explicit `jar { from(...) }`
 // block — adding one would duplicate entries (same observation as
 // sample-documents/chunker-pipedocs-court).
+//
+// Pin archiveBaseName to rootProject.name so the published jar is
+// always `embedder-pipedocs-court-<version>.jar` regardless of how
+// Gradle resolves the default (which is the rootProject.name anyway,
+// but being explicit prevents surprises if this ever becomes a subproject).
+tasks.named('jar').configure {
+    archiveBaseName = rootProject.name
+}
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
@@ -135,4 +143,34 @@ afterEvaluate {
         .configureEach { nmcpTask ->
             nmcpTask.dependsOn(tasks.withType(Sign))
         }
+}
+
+// Dry-run style check that PR workflows can invoke to confirm the publishing
+// wiring is intact without actually uploading anything. Mirrors the
+// grep-based sanity check in pipestream-platform's ci.yml but keeps the
+// assertions inside the build so they travel with the repo.
+tasks.register('validatePublish') {
+    group = 'verification'
+    description = 'Verify that required publish tasks and repositories are configured'
+    doLast {
+        def requiredTasks = [
+            'publishAllPublicationsToCentralPortal',
+            'publishAllPublicationsToCentralPortalSnapshots',
+            'publishAllPublicationsToMavenLocalRepository',
+        ]
+        def missing = requiredTasks.findAll { tasks.findByName(it) == null }
+        if (!missing.isEmpty()) {
+            throw new GradleException("Missing publish tasks: ${missing}")
+        }
+
+        def pub = publishing.publications.findByName('maven')
+        if (pub == null) {
+            throw new GradleException("Maven publication 'maven' is not configured")
+        }
+        if (pub.pom.url.getOrNull() == null) {
+            throw new GradleException("POM url is not set on maven publication")
+        }
+
+        logger.lifecycle("validatePublish: OK (version=${project.version}, jar=${tasks.jar.archiveFileName.get()})")
+    }
 }
