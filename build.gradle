@@ -1,0 +1,138 @@
+// Standalone data-only artifact — ships stage-2 embedder output PipeDocs
+// for the CourtListener 1000-doc corpus as classpath resources. Consumers
+// add this as a test-scope Maven dependency and read
+// /fixtures/court/{variant}/doc_NNNN.pb.gz via getResourceAsStream.
+//
+// Why standalone and not a subproject of sample-documents:
+// total artifact size (~835 MB across ~3300 per-doc .pb.gz files) pushes
+// against Sonatype Central Portal's ~1 GB per-upload limit when bundled
+// with other sample-documents modules; keeping this in its own repo and
+// own publish pipeline keeps the upload well under the limit.
+
+plugins {
+    id 'pl.allegro.tech.build.axion-release' version '1.21.0'
+    id 'com.gradleup.nmcp' version '1.2.0'
+    id 'java'
+    id 'maven-publish'
+    id 'signing'
+}
+
+scmVersion {
+    tag {
+        prefix = 'v'
+    }
+    checks {
+        uncommittedChanges = false
+        aheadOfRemote = false
+        snapshotDependencies = false
+    }
+}
+
+group = 'ai.pipestream'
+version = scmVersion.version
+
+description = 'Stage 2 PipeDocs — module-embedder output on the CourtListener 1000-doc corpus. Each doc carries per-chunk embeddings from two models (minilm + paraphrase-minilm). One gzipped protobuf file per doc.'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+    withSourcesJar()
+    withJavadocJar()
+}
+
+repositories {
+    mavenCentral()
+    mavenLocal()
+}
+
+// The default java-plugin resource pipeline already copies
+// src/main/resources/** into the jar. No explicit `jar { from(...) }`
+// block — adding one would duplicate entries (same observation as
+// sample-documents/chunker-pipedocs-court).
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+    options.locale = 'en'
+    options.charSet = 'UTF-8'
+    options.addStringOption('Xdoclint:-missing', '-quiet')
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+
+            pom {
+                name = project.name
+                description = project.description
+                url = 'https://github.com/ai-pipestream/embedder-pipedocs-court'
+
+                licenses {
+                    license {
+                        name = 'MIT License'
+                        url = 'https://opensource.org/licenses/MIT'
+                    }
+                }
+
+                developers {
+                    developer {
+                        id = 'krickert'
+                        name = 'Pipestream Engine Team'
+                    }
+                }
+
+                scm {
+                    connection = 'scm:git:https://github.com/ai-pipestream/embedder-pipedocs-court.git'
+                    developerConnection = 'scm:git:ssh://git@github.com/ai-pipestream/embedder-pipedocs-court.git'
+                    url = 'https://github.com/ai-pipestream/embedder-pipedocs-court'
+                }
+            }
+        }
+    }
+
+    repositories {
+        mavenLocal()
+
+        if (System.getenv("GITHUB_ACTOR") != null) {
+            maven {
+                name = 'GitHubPackages'
+                url = uri('https://maven.pkg.github.com/ai-pipestream/embedder-pipedocs-court')
+                credentials {
+                    username = System.getenv("GITHUB_ACTOR")
+                    password = System.getenv("GITHUB_TOKEN")
+                }
+            }
+        }
+    }
+}
+
+signing {
+    def signingKey = System.getenv("GPG_PRIVATE_KEY") ?: System.getenv("GPG_SIGNING_KEY")
+    def signingPassword = System.getenv("GPG_PASSPHRASE") ?: System.getenv("GPG_SIGNING_PASSPHRASE")
+
+    required { signingKey != null }
+
+    if (signingKey && signingPassword) {
+        useInMemoryPgpKeys(signingKey, signingPassword)
+        sign publishing.publications.maven
+    }
+}
+
+nmcp {
+    publishAllPublicationsToCentralPortal {
+        username = providers.environmentVariable("MAVEN_CENTRAL_USERNAME")
+        password = providers.environmentVariable("MAVEN_CENTRAL_PASSWORD")
+        publishingType = "AUTOMATIC"
+    }
+}
+
+afterEvaluate {
+    tasks.matching { it.name.startsWith("nmcp") }
+        .configureEach { nmcpTask ->
+            nmcpTask.dependsOn(tasks.withType(Sign))
+        }
+}
