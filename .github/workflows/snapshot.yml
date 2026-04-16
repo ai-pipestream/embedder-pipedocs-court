@@ -1,0 +1,128 @@
+name: Snapshot Publish
+
+# On push to main (and nightly to keep Central Portal snapshot rotation
+# honest) publish an X.Y.Z-SNAPSHOT to:
+#   1. Maven Central Portal snapshots (primary)
+#   2. GitHub Packages (fallback / dual-publish)
+#
+# Size note: this artifact ships ~835 MB of .pb.gz fixtures per jar,
+# near Central Portal's ~1 GB per-upload ceiling. The two targets run
+# in separate jobs so that if Central rejects the upload for size,
+# the GitHub Packages copy still lands and consumers have somewhere
+# to pull from. Central failure is NOT silently swallowed — that job
+# will exit non-zero and surface in the Actions UI.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        run: ./gradlew build --no-daemon
+
+      - name: Report jar size
+        # Soft check only — 835 MB is expected. If the total ever crosses
+        # 1 GB we want to know before Central Portal rejects the upload.
+        run: |
+          JAR=$(ls build/libs/embedder-pipedocs-court-*.jar | grep -v -- '-sources\|-javadoc' | head -1)
+          SIZE=$(stat -c%s "$JAR")
+          SIZE_MB=$((SIZE / 1024 / 1024))
+          echo "Main jar: $JAR = ${SIZE_MB} MB"
+          if [ "$SIZE_MB" -gt 950 ]; then
+            echo "::warning::Jar size ${SIZE_MB} MB is within 50 MB of Central Portal's 1 GB limit"
+          fi
+
+  publish-central:
+    name: Publish to Maven Central (snapshots)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Publish snapshot to Central Portal
+        # Single-module repo — use the per-project nmcp task directly.
+        # NOT nmcpAggregation (no subprojects to aggregate).
+        # snapshots don't need GPG signatures per Central's rules; the
+        # signing block in build.gradle no-ops when GPG_PRIVATE_KEY is
+        # unset, but we pass it anyway for parity with release.yml.
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: ./gradlew publishAllPublicationsToCentralPortalSnapshots --no-daemon --stacktrace
+
+  publish-github-packages:
+    name: Publish to GitHub Packages (snapshots)
+    # Intentionally depends only on `build`, not on `publish-central`.
+    # If Central rejects the upload (size, auth, etc.) we still want the
+    # snapshot to land on GitHub Packages as a fallback.
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Publish snapshot to GitHub Packages
+        # --continue tolerates 409 conflicts that GitHub Packages returns
+        # when re-uploading .asc signature files for SNAPSHOTs. Trailing
+        # `|| true` swallows the non-zero exit but every actual error
+        # is still visible in the log (same pattern as module-embedder).
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: ./gradlew publishAllPublicationsToGitHubPackagesRepository --no-daemon --continue || true
